@@ -1,0 +1,21 @@
+id = "delegate-watch"
+name = "Delegate Watch"
+version = "0.1.0"
+description = "Live viewer for codex-delegate runs dispatched through herdr-codex-relay."
+min_herdr_version = "0.8.0"
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "viewer"
+title = "👁 Delegated agent"
+placement = "popup"
+width = "85%"
+height = "85%"
+command = ["herdr-delegate-feed", "view"]
+
+[[actions]]
+id = "watch"
+title = "👁 Toggle delegated-agent viewer"
+description = "Open a live view of what the delegated Codex run in this pane is doing."
+contexts = ["pane", "global"]
+command = ["./open-viewer.sh"]

@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+# herdr-codex-relay — run a codex-delegate relay with correct Herdr state.
+#
+# Why this exists
+# ---------------
+# The codex-delegate skill dispatches with `codex exec` (headless), backgrounded
+# from Claude Code's Bash tool. Claude Code then returns to idle and restores its
+# "✳ Claude Code" title, so Herdr's screen-scraping detection marks the pane idle
+# -> "done" while Codex is still working underneath.
+#
+# Herdr's codex manifest can only recognise "working" from two interactive-TUI
+# artifacts (a braille spinner in the OSC title, or a "• Working (… esc to
+# interrupt)" status line). `codex exec` emits neither, so no working rule can
+# ever fire. This reports state explicitly instead.
+#
+# One agent per pane
+# ------------------
+# Herdr will NOT relabel a pane that already hosts a detected agent, and in
+# Herdr 0.8 it also ignores lifecycle state (`report-agent --state working`)
+# from this source on such a pane: screen detection keeps authority. So:
+#
+#   detected agent (e.g. Claude Code)  -> display metadata only:
+#       report-metadata --display-agent "codex ⇠ claude" --token delegate=…
+#   no agent (plain shell)             -> claim the pane as codex + working
+#
+# Live viewer
+# -----------
+# The run is registered with herdr-delegate-feed (forced --out-dir under
+# ~/.local/state/herdr-delegate/runs unless one is given) so the Herdr plugin
+# "delegate-watch" and `herdr-delegate-feed progress` can follow it live.
+#
+# Surviving SIGKILL
+# -----------------
+# The relay runs as a tracked child; TERM/INT/HUP are forwarded to it and its
+# exit code is returned. A trap cannot catch SIGKILL, and Claude Code does
+# hard-kill backgrounded Bash tool processes, so a detached watchdog clears the
+# pane state once both this wrapper and the relay are gone. On a clean exit the
+# trap kills the watchdog first. State is left alone while another delegated
+# run on the same pane is still live.
+#
+# Stops with the session
+# -----------------------
+# A detached guard watches the Claude Code process that dispatched the run; if
+# that session closes, the run is stopped (relay TERM, then KILL of the leftover
+# process tree, including codex's own process group).
+#
+# Usage — identical to relay.mjs:
+#   herdr-codex-relay --brief brief.txt --cd /path/to/repo [--read-only] [...]
+#
+# Outside a Herdr pane it is a transparent pass-through.
+# Set HERDR_RELAY_DEBUG=1 to see the reporting commands and their output.
+#
+# Env overrides: HERDR_BIN, CODEX_DELEGATE_RELAY, HERDR_REPORT_SOURCE,
+#                HERDR_DELEGATE_LABEL, HERDR_DELEGATE_FEED, HERDR_DELEGATE_STATE,
+#                HERDR_DELEGATE_WATCH_TAB, HERDR_DELEGATE_TAB_LABEL, HERDR_DELEGATE_ORCHESTRATOR_PID (0 = never stop
+#                with the session), HERDR_DELEGATE_KILL_GRACE (seconds, default 15)
+
+set -uo pipefail
+
+HERDR="${HERDR_BIN:-$HOME/.local/bin/herdr}"
+RELAY="${CODEX_DELEGATE_RELAY:-$HOME/.claude/skills/codex-delegate/scripts/relay.mjs}"
+SOURCE="${HERDR_REPORT_SOURCE:-codex-delegate}"
+DEBUG="${HERDR_RELAY_DEBUG:-0}"
+# Sidebar label while a delegated run is in flight. Deliberately distinct from
+# a bare "codex" so a hand-opened Codex pane is never confused with this one.
+LABEL="${HERDR_DELEGATE_LABEL:-codex ⇠ claude}"
+
+[ -f "$RELAY" ] || { echo "herdr-codex-relay: relay not found: $RELAY" >&2; exit 2; }
+
+dbg() { [ "$DEBUG" = "1" ] && echo "herdr-codex-relay: $*" >&2; return 0; }
+
+run_herdr() {
+    if [ "$DEBUG" = "1" ]; then
+        echo "herdr-codex-relay: herdr $*" >&2
+        "$HERDR" "$@" >&2 || echo "herdr-codex-relay: ^ failed (rc=$?)" >&2
+    else
+        "$HERDR" "$@" >/dev/null 2>&1 || true
+    fi
+}
+
+pane="${HERDR_PANE_ID:-}"
+reporting=0
+if [ "${HERDR_ENV:-}" = "1" ] && [ -n "$pane" ] && [ -x "$HERDR" ]; then
+    reporting=1
+fi
+
+# Lifecycle state is only reported when the pane hosts no detected agent. On a
+# pane whose agent Herdr detects (the usual case: Claude Code dispatching),
+# Herdr 0.8 gives lifecycle authority to screen detection plus a hardcoded
+# allowlist of hook sources; `report-agent` from this source is accepted but
+# never shown, so the pane keeps reading idle/done. There we publish display
+# metadata only (label + `delegate` token), which Herdr does honour.
+agent=""
+lifecycle=0
+if [ "$reporting" = 1 ]; then
+    agent=$("$HERDR" agent list 2>/dev/null | python3 -c '
+import json, sys
+try:
+    agents = json.load(sys.stdin)["result"]["agents"]
+except Exception:
+    sys.exit(0)
+for a in agents:
+    if a.get("pane_id") == sys.argv[1]:
+        sys.stdout.write(a.get("agent") or "")
+        break
+' "$pane" 2>/dev/null)
+    if [ -z "$agent" ]; then
+        agent="codex"
+        lifecycle=1
+    fi
+    dbg "pane=$pane agent=$agent lifecycle=$lifecycle"
+fi
+
+# Run registry for the live viewer (Herdr plugin "delegate-watch") and for
+# `herdr-delegate-feed progress`. Force a known --out-dir so the event stream
+# can be followed while the run is in flight. An explicit --out-dir wins, and a
+# malformed one (no value) is passed through untouched for relay.mjs to reject.
+FEED="${HERDR_DELEGATE_FEED:-$(command -v herdr-delegate-feed || true)}"
+STATE_DIR="${HERDR_DELEGATE_STATE:-$HOME/.local/state/herdr-delegate}"
+run_id="$(date +%Y%m%d-%H%M%S)-$$"
+args=("$@")
+out_dir=""
+out_dir_given=0
+brief_head=""
+for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[i]}" in
+        --out-dir)
+            out_dir_given=1
+            out_dir="${args[i + 1]:-}"
+            ;;
+        --brief)
+            if [ -f "${args[i + 1]:-}" ]; then
+                brief_head=$(grep -m1 -v '^[[:space:]]*$' "${args[i + 1]}" | cut -c1-200)
+            fi
+            ;;
+    esac
+done
+if [ "$out_dir_given" = 0 ]; then
+    out_dir="$STATE_DIR/runs/$run_id"
+    args+=(--out-dir "$out_dir")
+fi
+pane_key="${pane:-local}"
+started=$(date +%s.%N)
+
+# Clears this run's pane state, unless another delegated run on the same pane is
+# still live — then that run owns the label and clears it when it ends.
+clear_state() {
+    [ "$reporting" = 1 ] || return 0
+    if [ -n "$FEED" ] && [ -n "$("$FEED" _active --pane "$pane_key" --exclude "$run_id" 2>/dev/null)" ]; then
+        dbg "another run is live on $pane; leaving its state in place"
+        return 0
+    fi
+    if [ "$lifecycle" = 1 ]; then
+        run_herdr pane report-agent "$pane" --source "$SOURCE" --agent "$agent" --state idle
+        run_herdr pane release-agent "$pane" --source "$SOURCE" --agent "$agent"
+    fi
+    run_herdr pane report-metadata "$pane" --source "$SOURCE" --clear-display-agent \
+        --clear-token delegate
+}
+
+watchdog=""
+relay_pid=""
+released=0
+release() {
+    [ "$released" = 0 ] || return 0
+    released=1
+    # Stop the watchdog first: a clean exit must not leave it around to act later.
+    [ -n "$watchdog" ] && kill "$watchdog" 2>/dev/null
+    clear_state
+}
+trap release EXIT
+
+if [ "$reporting" = 1 ]; then
+    if [ "$lifecycle" = 1 ]; then
+        run_herdr pane report-agent "$pane" \
+            --source "$SOURCE" --agent "$agent" --state working \
+            --message "codex exec (delegated)"
+    fi
+    run_herdr pane report-metadata "$pane" \
+        --source "$SOURCE" --display-agent "$LABEL" \
+        --token "delegate=👁 codex running — click the 👁 codex tab"
+fi
+
+echo "herdr-codex-relay: live view: herdr-delegate-feed view --pane $pane_key  (run dir: $out_dir)" >&2
+
+# Run the relay as a tracked child rather than in the foreground, so its PID can
+# be recorded and followed. An async command in a non-interactive shell gets
+# /dev/null as stdin by default, so hand it the wrapper's stdin explicitly
+# (relay.mjs reads the brief from stdin when --brief is omitted).
+exec 3<&0
+node "$RELAY" "${args[@]}" <&3 3<&- &
+relay_pid=$!
+exec 3<&-
+
+# Forward termination to the relay; it kills codex and writes status "aborted".
+forward() { kill -"$1" "$relay_pid" 2>/dev/null; }
+trap 'forward TERM' TERM
+trap 'forward INT' INT
+trap 'forward HUP' HUP
+
+if [ -n "$FEED" ] && [ -n "$out_dir" ]; then
+    "$FEED" _register --pane "$pane_key" --run-id "$run_id" --pid "$$" \
+        --relay-pid "$relay_pid" --out-dir "$out_dir" --started "$started" \
+        --brief-head "$brief_head" 2>/dev/null ||
+        echo "herdr-codex-relay: warning: could not register run for the live viewer" >&2
+fi
+
+# Orchestrator guard: when the Claude Code session that dispatched this run goes
+# away (window closed, /exit, crash), stop the run instead of leaving Codex
+# working unattended. relay.mjs starts codex in its own process group, so it
+# would otherwise outlive the session. The guard is detached (setsid) so it
+# survives Claude Code SIGKILLing its background shells.
+#   1. SIGTERM the relay -> it kills codex's group and writes status "aborted"
+#   2. after a grace period, SIGKILL whatever of the run's process tree remains
+# The orchestrator is the nearest `claude` ancestor; override with
+# HERDR_DELEGATE_ORCHESTRATOR_PID, or disable with HERDR_DELEGATE_ORCHESTRATOR_PID=0.
+find_orchestrator() {
+    local p=$$ comm
+    while [ -n "$p" ] && [ "$p" -gt 1 ]; do
+        comm=$(cat "/proc/$p/comm" 2>/dev/null) || return 0
+        if [ "$comm" = "claude" ]; then
+            echo "$p"
+            return 0
+        fi
+        p=$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)
+    done
+}
+orchestrator="${HERDR_DELEGATE_ORCHESTRATOR_PID-$(find_orchestrator)}"
+if [ -n "$orchestrator" ] && [ "$orchestrator" != 0 ]; then
+    GUARD_ORCH="$orchestrator" GUARD_RELAY="$relay_pid" GUARD_WRAPPER="$$" \
+    GUARD_GRACE="${HERDR_DELEGATE_KILL_GRACE:-15}" GUARD_WRAPPER_PGID="$(ps -o pgid= -p $$ | tr -d ' ')" \
+    setsid nohup bash -c '
+        tree() {  # pid plus all descendants
+            local p
+            echo "$1"
+            for p in $(pgrep -P "$1" 2>/dev/null); do tree "$p"; done
+        }
+        while kill -0 "$GUARD_RELAY" 2>/dev/null; do
+            if ! kill -0 "$GUARD_ORCH" 2>/dev/null; then
+                pids=$(tree "$GUARD_RELAY")
+                pgids=$(for p in $pids; do ps -o pgid= -p "$p" 2>/dev/null; done | sort -u)
+                kill -TERM "$GUARD_RELAY" 2>/dev/null
+                for ((i = 0; i < GUARD_GRACE; i++)); do
+                    kill -0 "$GUARD_RELAY" 2>/dev/null || break
+                    sleep 1
+                done
+                sleep 1
+                # Only groups the run created itself (codex leads its own); never
+                # the wrapper'"'"'s group, which it shares with the caller'"'"'s shell.
+                for g in $pgids; do
+                    [ "$g" -gt 1 ] && [ "$g" != "$GUARD_WRAPPER_PGID" ] &&
+                        kill -KILL -- "-$g" 2>/dev/null
+                done
+                for p in $pids; do kill -KILL "$p" 2>/dev/null; done
+                kill -TERM "$GUARD_WRAPPER" 2>/dev/null
+                exit 0
+            fi
+            sleep 2
+        done
+    ' >/dev/null 2>&1 &
+    dbg "orchestrator guard pid=$! watching claude pid=$orchestrator"
+fi
+
+# Clickable "👁 codex" tab in the dispatching pane's workspace (plugin
+# "delegate-watch", viewer entrypoint in tab mode): one line in the tab bar, a
+# full-size live view when clicked. Herdr will not size a split below 10% of
+# the tab, so a tab is the smallest clickable surface. One tab per pane; it
+# follows newer runs on that pane and closes itself 30s after the last one ends.
+open_watch_tab() {
+    local pid_file="$STATE_DIR/tabs/${pane_key//:/-}.pid" tpid workspace opened tab_id
+    tpid=$(cat "$pid_file" 2>/dev/null)
+    if [ -n "$tpid" ] && kill -0 "$tpid" 2>/dev/null; then
+        dbg "watch tab already open for $pane (pid $tpid)"
+        return 0
+    fi
+    workspace="${HERDR_WORKSPACE_ID:-${pane%%:*}}"
+    opened=$("$HERDR" plugin pane open --plugin delegate-watch --entrypoint viewer \
+        --placement tab --workspace "$workspace" --no-focus \
+        --env "HERDR_DELEGATE_PANE=$pane" --env "HERDR_DELEGATE_TAB=1" \
+        --env "HERDR_DELEGATE_STATE=$STATE_DIR" 2>/dev/null) || {
+        dbg "could not open the watch tab"
+        return 0
+    }
+    tab_id=$(printf '%s' "$opened" | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin)["result"]["plugin_pane"]["pane"]["tab_id"])
+except Exception:
+    pass' 2>/dev/null)
+    [ -n "$tab_id" ] && run_herdr tab rename "$tab_id" "${HERDR_DELEGATE_TAB_LABEL:-👁 codex}"
+}
+
+if [ "$reporting" = 1 ] && [ "${HERDR_DELEGATE_WATCH_TAB:-1}" = 1 ]; then
+    open_watch_tab
+fi
+
+if [ "$reporting" = 1 ]; then
+    # Detached safety net for SIGKILL of this wrapper. It follows the relay, not
+    # the wrapper: a killed wrapper leaves the relay (and codex) running, and the
+    # pane must keep saying so until the relay itself is gone.
+    HERDR_WD_BIN="$HERDR" HERDR_WD_PANE="$pane" HERDR_WD_AGENT="$agent" \
+    HERDR_WD_SOURCE="$SOURCE" HERDR_WD_WRAPPER="$$" HERDR_WD_RELAY="$relay_pid" \
+    HERDR_WD_LIFECYCLE="$lifecycle" HERDR_WD_FEED="$FEED" HERDR_WD_KEY="$pane_key" \
+    HERDR_WD_RUN="$run_id" \
+    setsid nohup bash -c '
+        while kill -0 "$HERDR_WD_WRAPPER" 2>/dev/null || kill -0 "$HERDR_WD_RELAY" 2>/dev/null; do
+            sleep 3
+        done
+        if [ -n "$HERDR_WD_FEED" ] && [ -n "$("$HERDR_WD_FEED" _active --pane "$HERDR_WD_KEY" \
+                --exclude "$HERDR_WD_RUN" 2>/dev/null)" ]; then
+            exit 0
+        fi
+        if [ "$HERDR_WD_LIFECYCLE" = 1 ]; then
+            "$HERDR_WD_BIN" pane report-agent "$HERDR_WD_PANE" --source "$HERDR_WD_SOURCE" \
+                --agent "$HERDR_WD_AGENT" --state idle >/dev/null 2>&1
+            "$HERDR_WD_BIN" pane release-agent "$HERDR_WD_PANE" --source "$HERDR_WD_SOURCE" \
+                --agent "$HERDR_WD_AGENT" >/dev/null 2>&1
+        fi
+        "$HERDR_WD_BIN" pane report-metadata "$HERDR_WD_PANE" --source "$HERDR_WD_SOURCE" \
+            --clear-display-agent --clear-token delegate >/dev/null 2>&1
+    ' >/dev/null 2>&1 &
+    watchdog=$!
+    dbg "watchdog pid=$watchdog guarding wrapper=$$ relay=$relay_pid"
+fi
+
+# `wait` returns early when a trapped signal arrives; keep waiting until the
+# relay has actually exited so its exit code is the one we return.
+while :; do
+    wait "$relay_pid"
+    rc=$?
+    kill -0 "$relay_pid" 2>/dev/null || break
+done
+
+release
+exit "$rc"

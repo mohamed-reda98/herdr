@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+"""herdr-delegate-feed — follow a delegated Codex run as readable steps.
+
+herdr-codex-relay registers every run it dispatches:
+
+    ~/.local/state/herdr-delegate/registry/<run-id>.json   one record per run
+    ~/.local/state/herdr-delegate/panes/<pane>.json        latest run per pane (':' -> '-')
+
+and this script turns that run's raw `codex exec --json` event stream into text.
+
+Modes
+-----
+  view      Live, full-detail tail for a human (the Herdr popup viewer).
+  progress  One summary line every --interval seconds, for the orchestrating
+            model to run under Claude Code's Monitor tool. Always ends with a
+            `[codex finished: …]` line. Safe to re-arm: delivery state is kept
+            per run, so a new monitor resumes where the last one stopped —
+            including a run that finished between two monitors.
+
+Internal (used by herdr-codex-relay):
+  _register  record a run, publish the pane pointer, prune old runs
+  _active    print the ids of other live runs on a pane
+
+Run selection: --events FILE, else --pane ID, else $HERDR_DELEGATE_PANE, else
+$HERDR_PANE_ID, else (view) the latest run anywhere / (progress) pane "local".
+"""
+
+import argparse
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import sys
+import termios
+import time
+import tty
+from pathlib import Path
+
+STATE = Path(os.environ.get("HERDR_DELEGATE_STATE", Path.home() / ".local/state/herdr-delegate"))
+PANES = STATE / "panes"
+REGISTRY = STATE / "registry"
+RUNS = STATE / "runs"
+KEEP_RUNS = 30
+# A re-armed monitor resumes within minutes of the old one expiring; progress state
+# untouched for longer than this belongs to a monitor nobody re-armed.
+STALE_MONITOR_S = 45 * 60
+
+DIM, BOLD, ITALIC, RESET = "\033[2m", "\033[1m", "\033[3m", "\033[0m"
+RED, GREEN, YELLOW, BLUE, MAGENTA, CYAN = (f"\033[3{n}m" for n in range(1, 7))
+
+
+# ---------------------------------------------------------------- registry --
+
+def pane_key(pane):
+    return (pane or "local").replace(":", "-")
+
+
+def read_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def write_json_atomic(path, data):
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data))
+    os.replace(tmp, path)
+
+
+def pid_alive(pid):
+    if pid is None:
+        return None  # unknown
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def run_alive(rec):
+    """True/False, or None when the record carries no pid (explicit --events)."""
+    pids = [p for p in (rec.get("relayPid"), rec.get("pid")) if p]
+    if not pids:
+        return None
+    return any(pid_alive(p) for p in pids)
+
+
+def records(pane=None):
+    out = []
+    for f in REGISTRY.glob("*.json"):
+        if f.name.endswith(".progress.json"):
+            continue
+        rec = read_json(f)
+        if rec and (pane is None or rec.get("paneKey") == pane_key(pane)):
+            out.append(rec)
+    return sorted(out, key=lambda r: r.get("startedEpoch", 0))
+
+
+def progress_path(rec):
+    return REGISTRY / f"{rec['runId']}.progress.json"
+
+
+def do_register(args):
+    for d in (PANES, REGISTRY, RUNS):
+        d.mkdir(parents=True, exist_ok=True)
+    out_dir = os.path.abspath(args.out_dir)  # relay resolves relative --out-dir the same way
+    rec = {
+        "runId": args.run_id,
+        "pane": args.pane or "local",
+        "paneKey": pane_key(args.pane),
+        "pid": args.pid,
+        "relayPid": args.relay_pid,
+        "outDir": out_dir,
+        "eventsPath": os.path.join(out_dir, "events.jsonl"),
+        "startedEpoch": args.started,
+        "briefHead": args.brief_head,
+    }
+    write_json_atomic(REGISTRY / f"{args.run_id}.json", rec)
+    write_json_atomic(PANES / f"{rec['paneKey']}.json", rec)
+    prune()
+
+
+def prune():
+    """Keep the newest KEEP_RUNS records; never delete a live run."""
+    recs = sorted(records(), key=lambda r: r.get("startedEpoch", 0), reverse=True)
+    for rec in recs[KEEP_RUNS:]:
+        if run_alive(rec):
+            continue
+        run_dir = Path(rec.get("outDir", ""))
+        if run_dir.parent == RUNS and run_dir.is_dir():  # only dirs we created
+            shutil.rmtree(run_dir, ignore_errors=True)
+        for f in (REGISTRY / f"{rec['runId']}.json", progress_path(rec)):
+            f.unlink(missing_ok=True)
+    # Orphan run dirs with no record (e.g. from an older wrapper version), a day old.
+    known = {r.get("outDir") for r in recs}
+    for d in RUNS.iterdir() if RUNS.is_dir() else ():
+        if d.is_dir() and str(d) not in known and time.time() - d.stat().st_mtime > 86400:
+            shutil.rmtree(d, ignore_errors=True)
+
+
+def do_active(args):
+    ids = [r["runId"] for r in records(args.pane) if r["runId"] != args.exclude and run_alive(r)]
+    print("\n".join(ids))
+
+
+# -------------------------------------------------------------- event feed --
+
+SHELL_WRAP = re.compile(r"^(?:/usr)?(?:/bin/)?(?:ba|z)?sh\s+-l?c\s+")
+
+
+def short_cmd(cmd, limit=110):
+    # codex wraps commands as `/bin/zsh -lc '<script>'` or `/bin/zsh -c "<script>"`.
+    m = SHELL_WRAP.match(cmd)
+    if m:
+        cmd = cmd[m.end():]
+        if len(cmd) >= 2 and cmd[0] == cmd[-1] and cmd[0] in "'\"":
+            cmd = cmd[1:-1]
+    cmd = " ⏎ ".join(line.strip() for line in cmd.splitlines() if line.strip())
+    return cmd if len(cmd) <= limit else cmd[: limit - 1] + "…"
+
+
+def one_line(text, limit=160):
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+class Run:
+    """Tails events.jsonl incrementally, on complete-line byte boundaries."""
+
+    def __init__(self, rec, offset=0):
+        self.rec = rec
+        self.events = Path(rec["eventsPath"])
+        self.result = Path(rec["outDir"]) / "result.json"
+        self.offset = offset  # bytes read so far
+        self.buf = b""        # trailing incomplete line
+
+    def committed(self):
+        """Byte offset of the end of the last complete line consumed."""
+        return self.offset - len(self.buf)
+
+    def new_steps(self):
+        try:
+            with self.events.open("rb") as fh:
+                fh.seek(self.offset)
+                chunk = fh.read()
+        except OSError:
+            return []
+        self.offset += len(chunk)
+        self.buf += chunk
+        *lines, self.buf = self.buf.split(b"\n")
+        steps = []
+        for line in lines:
+            try:
+                ev = json.loads(line.decode("utf-8", errors="replace"))
+            except ValueError:
+                continue
+            step = parse_event(ev)
+            if step:
+                steps.append(step if len(step) == 3 else (*step, ""))
+        return steps
+
+    def finished(self):
+        """The result dict once the run is over, else None."""
+        alive = run_alive(self.rec)
+        if self.result.exists():
+            fresh = self.result.stat().st_mtime >= self.rec.get("startedEpoch", 0) - 2
+            if fresh:
+                res = read_json(self.result)
+                if res is not None:
+                    return res
+                if alive is False:
+                    return {"status": "unknown (result.json is malformed)"}
+                return None  # still being written
+        if alive is False:
+            return {"status": "gone (relay exited without writing result.json)"}
+        return None
+
+
+OUTPUT_LINES = 4  # command output lines shown in the viewer
+
+
+def tail_lines(text, n):
+    lines = [line.rstrip() for line in text.rstrip().splitlines()]
+    if len(lines) > n:
+        return "\n".join([f"… {len(lines) - n} more line(s)"] + lines[-n:])
+    return "\n".join(lines)
+
+
+def parse_event(ev):
+    t = ev.get("type")
+    item = ev.get("item") or {}
+    it = item.get("type")
+    if t == "thread.started":
+        return ("start", ev.get("thread_id", ""))
+    if t == "item.started" and it == "command_execution":
+        return ("cmd", short_cmd(item.get("command", "")))
+    if t == "item.completed" and it == "command_execution":
+        code = item.get("exit_code")
+        output = tail_lines(item.get("aggregated_output") or "", OUTPUT_LINES)
+        if code not in (0, None):
+            return ("cmd_fail", f"{short_cmd(item.get('command', ''))}  (exit {code})", output)
+        return ("out", "", output) if output else None
+    if t == "item.completed" and it == "file_change":
+        return ("files", ", ".join(f"{c.get('kind', '?')} {os.path.basename(c.get('path', ''))}" for c in item.get("changes", [])))
+    if t == "item.completed" and it == "agent_message":
+        return ("msg", item.get("text", ""))
+    if t == "item.completed" and it == "reasoning":
+        text = item.get("text") or " ".join(s.get("text", "") for s in item.get("summary", []) if isinstance(s, dict))
+        return ("think", text) if text else None
+    if t == "item.completed" and it in ("todo_list", "plan_update", "plan"):
+        return ("plan", json.dumps(item.get("items") or item.get("plan") or item, ensure_ascii=False))
+    if t == "item.completed" and it in ("mcp_tool_call", "web_search"):
+        return ("tool", f"{it}: {item.get('tool') or item.get('query') or ''}")
+    if t in ("error", "turn.failed"):
+        return ("error", json.dumps(ev.get("error") or ev.get("message") or ev, ensure_ascii=False))
+    if t == "turn.completed":
+        u = ev.get("usage") or {}
+        return ("turn", f"turn done — {u.get('input_tokens', '?')} in / {u.get('output_tokens', '?')} out tokens")
+    return None
+
+
+# -------------------------------------------------------------------- view --
+
+BOLD_MD = re.compile(r"\*\*(.+?)\*\*")
+
+
+def indent(text, color=DIM, prefix="    "):
+    return "\n".join(f"{color}{prefix}{line}{RESET}" for line in text.splitlines())
+
+
+def fmt_think(text):
+    """Codex reasoning summaries: **headings** as titles, paragraphs dimmed."""
+    out = []
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        m = BOLD_MD.fullmatch(line.strip())
+        out.append(f"{MAGENTA}🧠 {m.group(1)}{RESET}" if m else indent(line, DIM + ITALIC, "   "))
+    return "\n         ".join(out)
+
+
+def fmt_view(kind, text, detail=""):
+    if kind == "think":
+        return fmt_think(text)
+    if kind == "out":
+        return indent(detail)
+    line = {
+        "start": f"{CYAN}▶ codex session{RESET} {DIM}{text}{RESET}",
+        "cmd": f"{YELLOW}$ {text}{RESET}",
+        "cmd_fail": f"{RED}✗ {text}{RESET}",
+        "files": f"{GREEN}✎ {text}{RESET}",
+        "msg": f"{BOLD}💬 {text}{RESET}",
+        "plan": f"{CYAN}☰ {text}{RESET}",
+        "tool": f"{CYAN}⚙ {text}{RESET}",
+        "error": f"{RED}‼ {text}{RESET}",
+        "turn": f"{DIM}— {text}{RESET}",
+    }.get(kind, text)
+    return f"{line}\n{indent(detail)}" if detail else line
+
+
+def print_brief(rec, keys):
+    """The full brief Claude sent to Codex (relay writes it to <outDir>/brief.txt)."""
+    brief = Path(rec["outDir"]) / "brief.txt"
+    for _ in range(10):
+        if brief.exists():
+            break
+        if keys.read(0.3) in CLOSE_KEYS:
+            return False
+    rule = "─" * 72
+    print(f"{BOLD}{BLUE}📋 Brief from Claude → Codex{RESET}\n{BLUE}{rule}{RESET}")
+    try:
+        print(brief.read_text(errors="replace").rstrip())
+    except OSError:
+        print(f"{DIM}(brief not available){RESET}")
+    print(f"{BLUE}{rule}{RESET}\n", flush=True)
+    return True
+
+
+def pick_view_run(args, keys):
+    announced = False
+    while True:
+        if args.events:
+            ev = Path(args.events).resolve()
+            return {"runId": "explicit", "eventsPath": str(ev), "outDir": str(ev.parent), "startedEpoch": 0}, None
+        if args.pane:
+            rec = read_json(PANES / f"{pane_key(args.pane)}.json")
+            if rec:
+                return rec, None
+        latest = records()
+        if latest:
+            rec = latest[-1]
+            note = f"no delegated run from pane {args.pane} — showing the latest run, from pane {rec.get('pane')}" if args.pane else None
+            return rec, note
+        if not announced:
+            print(f"{DIM}Waiting for a delegated run…{RESET}", flush=True)
+            announced = True
+        if keys.read(1) in CLOSE_KEYS:
+            return None, None
+
+
+VIEWER_PID = STATE / "viewer.pid"
+CLOSE_KEYS = {"q", "Q", "\x1b", "w"}
+
+
+class Keys:
+    """Single-key input for the viewer; a no-op when stdin is not a terminal."""
+
+    def __init__(self):
+        self.fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+        self.saved = None
+
+    def __enter__(self):
+        if self.fd is not None:
+            self.saved = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *exc):
+        if self.saved is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+    def read(self, timeout):
+        """The key pressed within `timeout` seconds, else None."""
+        if self.fd is None:
+            time.sleep(timeout)
+            return None
+        ready, _, _ = select.select([self.fd], [], [], timeout)
+        return os.read(self.fd, 16).decode(errors="replace")[:1] if ready else None
+
+
+TAB_MODE = os.environ.get("HERDR_DELEGATE_TAB") == "1"
+TAB_LINGER_S = 30  # tab mode: how long a finished run stays on screen before the tab closes
+
+
+def do_view(args):
+    # The popup registers itself so `open-viewer.sh` can toggle it closed; the
+    # "👁 codex" tab registers per pane so the wrapper opens one tab per pane.
+    pid_file = STATE / "tabs" / f"{pane_key(args.pane)}.pid" if TAB_MODE else VIEWER_PID
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(str(os.getpid()))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # restores the tty on the way out
+    try:
+        with Keys() as keys:
+            rec, note = pick_view_run(args, keys)
+            while rec is not None:
+                rec = view_run(rec, note, keys, args)
+                note = None
+    finally:
+        if read_json(pid_file) == os.getpid():
+            pid_file.unlink(missing_ok=True)
+
+
+def view_run(rec, note, keys, args):
+    """Show one run. Returns the next run to show (tab mode), or None to exit."""
+    run = Run(rec)
+    print(f"\033[2J\033[H{BOLD}Delegated run{RESET} {DIM}pane {rec.get('pane', '?')} · {rec['outDir']}{RESET}")
+    if note:
+        print(f"{YELLOW}{note}{RESET}")
+    if TAB_MODE:
+        print(f"{DIM}Switch back to your tab to leave this view — the run keeps going. q closes this tab.{RESET}\n", flush=True)
+    else:
+        print(f"{DIM}q / Esc closes this viewer (Ctrl+b Alt+w toggles it) — the run keeps going.{RESET}\n", flush=True)
+    if not print_brief(rec, keys):
+        return None
+    print(f"{BOLD}Codex steps{RESET}", flush=True)
+
+    def flush_steps():
+        for kind, text, detail in run.new_steps():
+            stamp = " " * 9 if kind == "out" else f"{DIM}{time.strftime('%H:%M:%S')}{RESET} "
+            print(f"{stamp}{fmt_view(kind, text, detail)}", flush=True)
+
+    while True:
+        flush_steps()
+        res = run.finished()
+        if res is not None:
+            flush_steps()
+            color = GREEN if res.get("status") == "completed" else RED
+            print(f"\n{color}{BOLD}■ run {res.get('status')}{RESET}  touched: {len(res.get('touchedFiles') or [])} file(s)")
+            if TAB_MODE:
+                return linger_for_next_run(rec, keys)
+            print(f"{DIM}Press any key to close.{RESET}", flush=True)
+            while keys.fd is not None and keys.read(3600) is None:
+                pass
+            return None
+        if keys.read(0.5) in CLOSE_KEYS:
+            return None
+
+
+def linger_for_next_run(rec, keys):
+    """Tab mode: keep the result visible briefly; follow a newer run on the pane if one starts."""
+    print(f"{DIM}This tab closes in {TAB_LINGER_S}s (any key closes it now).{RESET}", flush=True)
+    deadline = time.time() + TAB_LINGER_S
+    while time.time() < deadline:
+        latest = read_json(PANES / f"{rec.get('paneKey', pane_key(rec.get('pane')))}.json")
+        if latest and latest.get("runId") != rec.get("runId") and run_alive(latest):
+            return latest
+        if keys.read(1) is not None:
+            return None
+    return None
+
+
+# ---------------------------------------------------------------- progress --
+
+def summarize(steps, elapsed):
+    cmds = [t for k, t, _ in steps if k == "cmd"]
+    fails = [t for k, t, _ in steps if k == "cmd_fail"]
+    files = [t for k, t, _ in steps if k == "files"]
+    msgs = [t for k, t, _ in steps if k in ("msg", "think", "plan")]
+    errors = [t for k, t, _ in steps if k == "error"]
+    head = f"[codex +{elapsed // 60}m]"
+    if not any(k != "out" for k, _, _ in steps):
+        return f"{head} no new events this interval (still running — may be thinking or a long command)"
+    parts = [head]
+    if msgs:
+        parts.append(f"says: \"{one_line(msgs[-1], 220)}\"")
+    if cmds:
+        parts.append(f"ran {len(cmds)} cmd(s), latest: `{short_cmd(cmds[-1], 90)}`")
+    if fails:
+        parts.append(f"{len(fails)} failed: `{short_cmd(fails[-1], 80)}`")
+    if files:
+        parts.append(f"edited: {one_line('; '.join(files), 160)}")
+    if errors:
+        parts.append(f"ERROR: {one_line(errors[-1], 160)}")
+    return " | ".join(parts)
+
+
+def pick_progress_run(args, since):
+    """A run whose monitor expired before its finish was delivered (oldest first),
+    else the newest run on this pane that started within the lookback window."""
+    while True:
+        if args.events:
+            ev = Path(args.events).resolve()
+            rec = {"runId": "explicit", "eventsPath": str(ev), "outDir": str(ev.parent), "startedEpoch": 0}
+            return rec, {}
+        recs = records(args.pane)
+        for rec in recs:
+            state = read_json(progress_path(rec))
+            if state is not None:
+                if state.get("terminalSent"):
+                    continue
+                if time.time() - state.get("savedAt", 0) > STALE_MONITOR_S:
+                    # Its monitor died long ago and was never re-armed; don't let a
+                    # stale run shadow the one being dispatched now.
+                    write_json_atomic(progress_path(rec), {**state, "terminalSent": True, "abandoned": True})
+                    continue
+                return rec, state
+        for rec in reversed(recs):
+            if rec.get("startedEpoch", 0) >= since and read_json(progress_path(rec)) is None:
+                return rec, None
+        time.sleep(1)
+
+
+def do_progress(args):
+    since = time.time() - args.lookback
+    rec, state = pick_progress_run(args, since)
+    explicit = rec["runId"] == "explicit"
+    run = Run(rec, offset=(state or {}).get("offset", 0))
+    start = rec.get("startedEpoch") or time.time()
+
+    def save(**extra):
+        if not explicit:
+            write_json_atomic(progress_path(rec), {"offset": run.committed(), "savedAt": time.time(), **extra})
+
+    if state:
+        print(f"[codex still running, +{int(time.time() - start) // 60}m] watching again", flush=True)
+    else:
+        print(f"[codex started] run dir: {rec['outDir']}", flush=True)
+        save()
+    pending = []
+    next_tick = time.time() + args.interval
+    while True:
+        pending += run.new_steps()
+        res = run.finished()
+        if res is not None:
+            pending += run.new_steps()
+            tail = summarize(pending, int(time.time() - start)) + " — " if pending else ""
+            print(f"[codex finished: {res.get('status')}] {tail}read {run.result}", flush=True)
+            save(terminalSent=True)
+            return
+        if time.time() >= next_tick:
+            print(summarize(pending, int(time.time() - start)), flush=True)
+            save()
+            pending = []
+            next_tick += args.interval
+        time.sleep(2)
+
+
+# -------------------------------------------------------------------- main --
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="mode", required=True)
+    for name in ("view", "progress"):
+        p = sub.add_parser(name)
+        p.add_argument("--pane", default=None, help="Herdr pane id that dispatched the run")
+        p.add_argument("--events", default=None, help="explicit events.jsonl path")
+        p.add_argument("--interval", type=int, default=120, help="progress: seconds between summaries")
+        p.add_argument("--lookback", type=int, default=60,
+                       help="progress: accept a new run that started up to N seconds before this script")
+    reg = sub.add_parser("_register")
+    reg.add_argument("--pane", default="")
+    reg.add_argument("--run-id", required=True)
+    reg.add_argument("--pid", type=int, required=True)
+    reg.add_argument("--relay-pid", type=int, required=True)
+    reg.add_argument("--out-dir", required=True)
+    reg.add_argument("--started", type=float, required=True)
+    reg.add_argument("--brief-head", default="")
+    act = sub.add_parser("_active")
+    act.add_argument("--pane", default="")
+    act.add_argument("--exclude", default="")
+    args = ap.parse_args()
+
+    if args.mode == "_register":
+        return do_register(args)
+    if args.mode == "_active":
+        return do_active(args)
+    if args.pane is None and not args.events:
+        # The popup viewer gets the dispatching pane via HERDR_DELEGATE_PANE; its
+        # own HERDR_PANE_ID is the popup. Empty means "no specific pane".
+        if "HERDR_DELEGATE_PANE" in os.environ:
+            args.pane = os.environ["HERDR_DELEGATE_PANE"] or None
+        else:
+            args.pane = os.environ.get("HERDR_PANE_ID") or None
+    if args.mode == "progress" and not args.events:
+        args.pane = args.pane or "local"  # matches the wrapper outside Herdr
+    try:
+        (do_view if args.mode == "view" else do_progress)(args)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

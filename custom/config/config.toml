@@ -1,0 +1,16 @@
+onboarding = false
+[ui]
+agent_panel_sort = "priority"
+show_agent_labels_on_pane_borders = false
+
+[ui.toast]
+delivery = "herdr"
+
+# delegate-watch: live view of a codex-delegate run (see ~/.local/share/herdr-plugins/delegate-watch)
+[[keys.command]]
+key = "prefix+alt+w"
+type = "shell"
+command = "herdr plugin action invoke watch --plugin delegate-watch"
+
+[ui.sidebar.agents.rows_by_agent]
+claude = [["state_icon", "workspace", "tab"], ["agent", "$delegate"]]

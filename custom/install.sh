@@ -29,10 +29,10 @@ done
 
 if command -v herdr >/dev/null; then
     herdr plugin unlink delegate-watch >/dev/null 2>&1 || true
-    herdr plugin link --enabled "$here/plugins/delegate-watch"
+    herdr plugin link "$here/plugins/delegate-watch"
 else
     echo "herdr not found on PATH; link the plugin later with:"
-    echo "  herdr plugin link --enabled \"$here/plugins/delegate-watch\""
+    echo "  herdr plugin link \"$here/plugins/delegate-watch\""
 fi
 
 if [ "$link_config" = 1 ]; then

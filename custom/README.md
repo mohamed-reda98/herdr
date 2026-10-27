@@ -1,5 +1,9 @@
 # Custom additions
 
+> **Replaced by [herdr-crew](https://github.com/mohamed-reda98/herdr-crew).** It gives every
+> delegate (Codex or Claude) and every subagent its own view tab, and summarizes them on the
+> orchestrator's sidebar row. The pieces below are no longer used; they stay here as a fallback.
+
 Local additions on top of upstream Herdr, kept in this fork so they are
 versioned. Nothing here changes Herdr's own source; it all runs beside a stock
 Herdr build.
